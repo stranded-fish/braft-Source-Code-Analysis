@@ -17,10 +17,18 @@
 # source shflags from current directory
 mydir="${BASH_SOURCE%/*}"
 if [[ ! -d "$mydir" ]]; then mydir="$PWD"; fi
+
+# 导入 shflags 脚本（该脚本能够用类似 gflags 的风格来处理 shell）
 . $mydir/../shflags
 
 
 # define command-line flags
+# 示例：DEFINE_integer thread_num 1 'Number of sending thread'
+# 该语句定义了一个 flags 变量，其中：
+#   变量名：thread_num，可使用 --thread_num 参数指定 FLAGS_thread_num 变量值
+#   变量默认值：1
+#   变量描述：'Number of sending thread'
+# 实例：bash run_client.sh --thread_num 4 "指定 thread_num = 4"
 DEFINE_boolean clean 1 'Remove old "runtime" dir before running'
 DEFINE_integer write_percentage 100 'Percentage of write operation'
 DEFINE_integer bthread_concurrency '8' 'Number of worker pthreads'
@@ -41,6 +49,7 @@ if [ "$FLAGS_valgrind" == "true" ] && [ $(which valgrind) ] ; then
     VALGRIND="valgrind --tool=memcheck --leak-check=full"
 fi
 
+# 初始化 raft server 集群的 IP 和 port
 raft_peers=""
 for ((i=0; i<$FLAGS_server_num; ++i)); do
     raft_peers="${raft_peers}${IP}:$((${FLAGS_server_port}+i)):0,"
@@ -48,6 +57,15 @@ done
 
 export TCMALLOC_SAMPLE_PARAMETER=524288
 
+# 启动客户端，默认启动命令：
+# ./block_client
+#     --write_percentage=100
+#     --bthread_concurrency=8
+#     --conf=127.0.0.1:8200:0,127.0.0.1:8201:0,127.0.0.1:8202:0,
+#     --crash_on_fatal_log=true
+#     --log_each_request=false
+#     --thread_num=1
+#     --use_bthread=true
 ${VALGRIND} ./block_client \
         --write_percentage=${FLAGS_write_percentage} \
         --bthread_concurrency=${FLAGS_bthread_concurrency} \
