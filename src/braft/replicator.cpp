@@ -137,9 +137,9 @@ int Replicator::start(const ReplicatorOptions& options, ReplicatorId *id) {
               << ", group " << r->_options.group_id;
     r->_catchup_closure = NULL;
     r->_update_last_rpc_send_timestamp(butil::monotonic_time_ms());
-    r->_start_heartbeat_timer(butil::gettimeofday_us());
+    r->_start_heartbeat_timer(butil::gettimeofday_us()); // 启动 heartbeat_timer
     // Note: r->_id is unlock in _send_empty_entries, don't touch r ever after
-    r->_send_empty_entries(false);
+    r->_send_empty_entries(false); // 发送空的 entries 通知 follower 自己的 leader 身份
     return 0;
 }
 
@@ -261,6 +261,7 @@ void Replicator::_block(long start_time_us, int error_code) {
     }
 }
 
+// 收到心跳返回
 void Replicator::_on_heartbeat_returned(
         ReplicatorId id, brpc::Controller* cntl,
         AppendEntriesRequest* request, 
@@ -297,6 +298,8 @@ void Replicator::_on_heartbeat_returned(
         return;
     }
     r->_consecutive_error_times = 0;
+    
+    // 若 response term > 自身当前 term，则更新自身 term 并回退到 follower
     if (response->term() > r->_options.term) {
         ss << " fail, greater term " << response->term()
            << " expect term " << r->_options.term;
@@ -313,6 +316,8 @@ void Replicator::_on_heartbeat_returned(
         status.set_error(EHIGHERTERMRESPONSE, "Leader receives higher term "
                 "heartbeat_response from peer:%s", r->_options.peer_id.to_string().c_str());
         r->_destroy();
+
+        // 更新自身 term，并回退到 follower
         node_impl->increase_term_to(response->term(), status);
         node_impl->Release();
         return;
@@ -538,6 +543,7 @@ int Replicator::_fill_common_fields(AppendEntriesRequest* request,
     return 0;
 }
 
+// 发送空 entries
 void Replicator::_send_empty_entries(bool is_heartbeat) {
     std::unique_ptr<brpc::Controller> cntl(new brpc::Controller);
     std::unique_ptr<AppendEntriesRequest> request(new AppendEntriesRequest);
@@ -940,8 +946,12 @@ void Replicator::_notify_on_caught_up(int error_code, bool before_destroy) {
     return run_closure_in_bthread(saved_catchup_closure);
 }
 
+// heartbeat_timer - 心跳计时器，处理心跳超时
 void Replicator::_on_timedout(void* arg) {
     bthread_id_t id = { (uint64_t)arg };
+    
+    /* 将对应的 id 设置为 ETIMEDOUT（Connection timed out）
+    然后进一步调用 Replicator::_on_error 新建 bthread 重新 _send_heartbeat */
     bthread_id_error(id, ETIMEDOUT);
 }
 
@@ -955,6 +965,7 @@ void Replicator::_start_heartbeat_timer(long start_time_us) {
     }
 }
 
+// 发送心跳
 void* Replicator::_send_heartbeat(void* arg) {
     Replicator* r = NULL;
     bthread_id_t id = { (uint64_t)arg };
@@ -963,6 +974,8 @@ void* Replicator::_send_heartbeat(void* arg) {
         return NULL;
     }
     // id is unlock in _send_empty_entries;
+    
+    // 发送空 entries 作为心跳
     r->_send_empty_entries(true);
     return NULL;
 }

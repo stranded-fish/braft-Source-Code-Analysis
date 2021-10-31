@@ -478,16 +478,18 @@ int NodeImpl::bootstrap(const BootstrapOptions& options) {
     return 0;
 }
 
+// 用户接口 - 初始化 Raft 节点
 int NodeImpl::init(const NodeOptions& options) {
     _options = options;
 
-    // check _server_id
+    // 检测用户是否设置了该节点 IP 地址
     if (butil::IP_ANY == _server_id.addr.ip) {
         LOG(ERROR) << "Group " << _group_id 
                    << " Node can't started from IP_ANY";
         return -1;
     }
 
+    // 检测用户是否执行了 add_service() 以添加 raft service
     if (!global_node_manager->server_exists(_server_id.addr)) {
         LOG(ERROR) << "Group " << _group_id
                    << " No RPC Server attached to " << _server_id.addr
@@ -495,6 +497,16 @@ int NodeImpl::init(const NodeOptions& options) {
         return -1;
     }
 
+    /* 初始化四个定时器
+        _vote_timer:
+            负责正式选举阶段的超时，超时后调用 NodeImpl::handle_vote_timeout()
+        _election_timer: 
+            选举超时计时器，当 follower 在超过 election_timeout_ms 时间内没有收到 leader 的任何消息时，
+            就会触发选举超时，并调用 NodeImpl::handle_election_timeout
+        _stepdown_timer : 
+            leader 当选时启动，超时后调用 NodeImpl::handle_stepdown_timeout()
+        _snapshot_timer : 
+            快照保存的间隔时间，超时后调用 NodeImpl::handle_snapshot_timeout() */
     CHECK_EQ(0, _vote_timer.init(this, options.election_timeout_ms + options.max_clock_drift_ms));
     CHECK_EQ(0, _election_timer.init(this, options.election_timeout_ms));
     CHECK_EQ(0, _stepdown_timer.init(this, options.election_timeout_ms));
@@ -598,7 +610,7 @@ int NodeImpl::init(const NodeOptions& options) {
         : NULL;
     _replicator_group.init(NodeId(_group_id, _server_id), rg_options);
 
-    // set state to follower
+    // 初始化 state 为 follower
     _state = STATE_FOLLOWER;
 
     LOG(INFO) << "node " << _group_id << ":" << _server_id << " init,"
@@ -614,6 +626,8 @@ int NodeImpl::init(const NodeOptions& options) {
         _snapshot_timer.start();
     }
 
+    /* 如果设置的 conf 非空，就会调用 step_down 函数，重置 leader_id 和相关环境变量，
+    由于当前 state 为 follower，会重置 pre_vote 环境变量，并启动 _election_timer */
     if (!_conf.empty()) {
         step_down(_current_term, false, butil::Status::OK());
     }
@@ -630,8 +644,8 @@ int NodeImpl::init(const NodeOptions& options) {
     std::unique_lock<raft_mutex_t> lck(_mutex);
     if (_conf.stable() && _conf.conf.size() == 1u
             && _conf.conf.contains(_server_id)) {
-        // The group contains only this server which must be the LEADER, trigger
-        // the timer immediately.
+
+        // 如果 conf 集群中只有一个 server 会立即调用 elect_self 发起正式选举，成为 leader
         elect_self(&lck);
     }
 
@@ -798,6 +812,7 @@ void NodeImpl::check_dead_nodes(const Configuration& conf, int64_t now_ms) {
     step_down(_current_term, false, status);
 }
 
+// 处理 leader step_down 超时
 void NodeImpl::handle_stepdown_timeout() {
     BAIDU_SCOPED_LOCK(_mutex);
 
@@ -810,6 +825,8 @@ void NodeImpl::handle_stepdown_timeout() {
     }
 
     int64_t now = butil::monotonic_time_ms();
+
+    // 判断当前存活节点数是否满足多数派的要求（即超过半数），如果没有则回退到 follower
     check_dead_nodes(_conf.conf, now);
     if (!_conf.old_conf.empty()) {
         check_dead_nodes(_conf.old_conf, now);
@@ -1026,6 +1043,7 @@ void NodeImpl::join() {
     Replicator::join(_waking_candidate);
 }
 
+// 处理 election_timeout 选举超时，该函数重置当前 leader 为空，并发起 prevote
 void NodeImpl::handle_election_timeout() {
     std::unique_lock<raft_mutex_t> lck(_mutex);
 
@@ -1047,8 +1065,9 @@ void NodeImpl::handle_election_timeout() {
     butil::Status status;
     status.set_error(ERAFTTIMEDOUT, "Lost connection from leader %s",
                                     _leader_id.to_string().c_str());
-    reset_leader_id(empty_id, status);
+    reset_leader_id(empty_id, status); // 重置当前 leader 为空
 
+    // 为了避免网络分区带来的潜在问题，在发起正式的选举前，要先进行 prevote
     return pre_vote(&lck, triggered);
     // Don't touch any thing of *this ever after
 }
@@ -1324,13 +1343,17 @@ void NodeImpl::on_error(const Error& e) {
     lck.unlock();
 }
 
+// 处理投票超时
 void NodeImpl::handle_vote_timeout() {
     std::unique_lock<raft_mutex_t> lck(_mutex);
 
-    // check state
+    // 首先判断是否是 candidate 状态，如果不是则直接返回
     if (_state != STATE_CANDIDATE) {
     	return;
     }
+
+    /* 判断是否设置了 FLAGS_raft_step_down_when_vote_timedout
+    如果设置了，则回退到 follower 并重新开始 prevote，否则直接开始新的选举 */
     if (FLAGS_raft_step_down_when_vote_timedout) {
         // step down to follower
         LOG(WARNING) << "node " << node_id()
@@ -1349,6 +1372,7 @@ void NodeImpl::handle_vote_timeout() {
     }
 }
 
+// 发起正式投票 RPC 的节点收到 response 后处理请求
 void NodeImpl::handle_request_vote_response(const PeerId& peer_id, const int64_t term,
                                             const int64_t ctx_version,
                                             const RequestVoteResponse& response) {
@@ -1362,21 +1386,21 @@ void NodeImpl::handle_request_vote_response(const PeerId& peer_id, const int64_t
         return;
     }
 
-    // check state
+    // 首先确认当前状态是不是 candidate（因为可能已经当选成功，节点成为了 leader）
     if (_state != STATE_CANDIDATE) {
         LOG(WARNING) << "node " << _group_id << ":" << _server_id
                      << " received invalid RequestVoteResponse from " << peer_id
                      << " state not in CANDIDATE but " << state2str(_state);
         return;
     }
-    // check stale response
+    // 然后检查是不是当前 term（因为可能收到上一次 rpc 的 response）
     if (term != _current_term) {
         LOG(WARNING) << "node " << _group_id << ":" << _server_id
                      << " received stale RequestVoteResponse from " << peer_id
                      << " term " << term << " current_term " << _current_term;
         return;
     }
-    // check response term
+    // 如果收到的 term 大于自身的 term，则回退到 follower 状态
     if (response.term() > _current_term) {
         LOG(WARNING) << "node " << _group_id << ":" << _server_id
                      << " received invalid RequestVoteResponse from " << peer_id
@@ -1384,7 +1408,7 @@ void NodeImpl::handle_request_vote_response(const PeerId& peer_id, const int64_t
         butil::Status status;
         status.set_error(EHIGHERTERMRESPONSE, "Raft node receives higher term "
                 "request_vote_response.");
-        step_down(response.term(), false, status);
+        step_down(response.term(), false, status); // 回退到 follower 状态
         return;
     }
 
@@ -1393,6 +1417,8 @@ void NodeImpl::handle_request_vote_response(const PeerId& peer_id, const int64_t
               << " term " << response.term() << " granted " << response.granted()
               << " rejected_by_lease " << response.rejected_by_lease()
               << " disrupted " << response.disrupted();
+
+    // 如果没有收到选票直接返回
     if (!response.granted() && !response.rejected_by_lease()) {
         return;
     }
@@ -1400,12 +1426,16 @@ void NodeImpl::handle_request_vote_response(const PeerId& peer_id, const int64_t
     if (response.disrupted()) {
         _vote_ctx.set_disrupted_leader(DisruptedLeader(peer_id, response.previous_term()));
     }
+
+    // 给自己投票，并检查投票结果
     if (response.granted()) {
         _vote_ctx.grant(peer_id);
         if (peer_id == _follower_lease.last_leader()) {
             _vote_ctx.grant(_server_id);
             _vote_ctx.stop_grant_self_timer(this);
         }
+
+        // 获取到半数选票，成功当选 leader
         if (_vote_ctx.granted()) {
             return become_leader();
         }
@@ -1458,6 +1488,7 @@ struct OnRequestVoteRPCDone : public google::protobuf::Closure {
     NodeImpl* node;
 };
 
+// 发起 prevote 的 node 在 RPC 响应后调用回调，处理 prevote response 请求
 void NodeImpl::handle_pre_vote_response(const PeerId& peer_id, const int64_t term,
                                         const int64_t ctx_version,
                                         const RequestVoteResponse& response) {
@@ -1491,6 +1522,8 @@ void NodeImpl::handle_pre_vote_response(const PeerId& peer_id, const int64_t ter
                      << " received invalid PreVoteResponse from " << peer_id
                      << " term " << response.term() << " expect " << _current_term;
         butil::Status status;
+
+        // 如果收到的 term 大于自身的 term，则回退到 follower 状态
         status.set_error(EHIGHERTERMRESPONSE, "Raft node receives higher term "
                 "pre_vote_response.");
         step_down(response.term(), false, status);
@@ -1516,6 +1549,8 @@ void NodeImpl::handle_pre_vote_response(const PeerId& peer_id, const int64_t ter
         _pre_vote_ctx.set_disrupted_leader(DisruptedLeader(peer_id, response.previous_term()));
     }
     std::set<PeerId> peers;
+
+    // 当前 leader 租约未过期
     if (response.rejected_by_lease()) {
         // Temporarily reserve the vote of follower because the lease is
         // still valid. Until we make sure the leader can be disrupted,
@@ -1526,6 +1561,9 @@ void NodeImpl::handle_pre_vote_response(const PeerId& peer_id, const int64_t ter
         _pre_vote_ctx.pop_grantable_peers(&peers);
         peers.insert(peer_id);
     }
+
+    /* 如果收到选票，则更新 _pre_vote_ctx，_pre_vote_ctx 中保存着当前的投票情况
+    其成员 _quorum 多数派初始为 peer 数量的一半 + 1，每次 grant 后就会 - 1 */
     for (std::set<PeerId>::const_iterator it = peers.begin();
             it != peers.end(); ++it) {
         _pre_vote_ctx.grant(*it);
@@ -1534,6 +1572,8 @@ void NodeImpl::handle_pre_vote_response(const PeerId& peer_id, const int64_t ter
             _pre_vote_ctx.stop_grant_self_timer(this);
         }
     }
+
+    // 如果获得了大多数选票，则开始进行正式的选举
     if (_pre_vote_ctx.granted()) {
         elect_self(&lck);
     }
@@ -1571,6 +1611,8 @@ struct OnPreVoteRPCDone : public google::protobuf::Closure {
     NodeImpl* node;
 };
 
+/* 在正式选举之前，会先发起一次预选举 - prevote，prevote 赢得选举的条件与正常选举相同，
+该请求用于判断该节点是否能够真的赢得选举，如果可以，则增加自己的 term，并发起真正的选举 */
 void NodeImpl::pre_vote(std::unique_lock<raft_mutex_t>* lck, bool triggered) {
     LOG(INFO) << "node " << _group_id << ":" << _server_id
               << " term " << _current_term << " start pre_vote";
@@ -1603,6 +1645,7 @@ void NodeImpl::pre_vote(std::unique_lock<raft_mutex_t>* lck, bool triggered) {
     std::set<PeerId> peers;
     _conf.list_peers(&peers);
 
+    // 遍历所有的 peer，并向他们发送 preVote rpc 请求
     for (std::set<PeerId>::const_iterator
             iter = peers.begin(); iter != peers.end(); ++iter) {
         if (*iter == _server_id) {
@@ -1618,6 +1661,7 @@ void NodeImpl::pre_vote(std::unique_lock<raft_mutex_t>* lck, bool triggered) {
             continue;
         }
 
+        // 创建回调，该回调 run 函数会调用 NodeImpl::handle_pre_vote_response 处理 response
         OnPreVoteRPCDone* done = new OnPreVoteRPCDone(
                 *iter, _current_term, _pre_vote_ctx.version(), this);
         done->cntl.set_timeout_ms(_options.election_timeout_ms);
@@ -1628,13 +1672,18 @@ void NodeImpl::pre_vote(std::unique_lock<raft_mutex_t>* lck, bool triggered) {
         done->request.set_last_log_index(last_log_id.index);
         done->request.set_last_log_term(last_log_id.term);
 
+        // 发送 rpc 请求
         RaftService_Stub stub(&channel);
         stub.pre_vote(&done->cntl, &done->request, &done->response, done);
     }
+
+    /* 尝试给自己投票，首先判断自身 follower 租约 lease 是否到期，
+    若到期，则给自己投票，并检查所得票数，若获得大多数投票，则开始正式选举，否则直接返回
+    若没有到期，则启动 start_grant_self_timer */
     grant_self(&_pre_vote_ctx, lck);
 }
 
-// in lock
+// in lock - 发起正式投票
 void NodeImpl::elect_self(std::unique_lock<raft_mutex_t>* lck, 
                           bool old_leader_stepped_down) {
     LOG(INFO) << "node " << _group_id << ":" << _server_id
@@ -1644,7 +1693,8 @@ void NodeImpl::elect_self(std::unique_lock<raft_mutex_t>* lck,
                      << " can't do elect_self as it is not in " << _conf.conf;
         return;
     }
-    // cancel follower election timer
+    /* 如果当前是 follower 状态，则停止 _election_timer，因为 _election_timer
+    用于触发选举超时 - prevote，而此时该节点 prevote 已经成功当选了，故不再需要该计时器 */
     if (_state == STATE_FOLLOWER) {
         BRAFT_VLOG << "node " << _group_id << ":" << _server_id
                    << " term " << _current_term << " stop election_timer";
@@ -1657,14 +1707,18 @@ void NodeImpl::elect_self(std::unique_lock<raft_mutex_t>* lck,
     butil::Status status;
     status.set_error(ERAFTTIMEDOUT, "A follower's leader_id is reset to NULL "
                                     "as it begins to request_vote.");
+    // 将 leader 设置为空
     reset_leader_id(empty_id, status);
-
+    
+    // 将自己的状态变为 candidate，current_term + 1，然后给自己投票
     _state = STATE_CANDIDATE;
     _current_term++;
     _voted_id = _server_id;
 
     BRAFT_VLOG << "node " << _group_id << ":" << _server_id
                << " term " << _current_term << " start vote_timer";
+
+    // 启动 vote_timer，该定时器负责选举阶段的超时
     _vote_timer.start();
     _pre_vote_ctx.reset(this);
     _vote_ctx.init(this, false);
@@ -1675,6 +1729,8 @@ void NodeImpl::elect_self(std::unique_lock<raft_mutex_t>* lck,
 
     int64_t old_term = _current_term;
     // get last_log_id outof node mutex
+
+    // 获取最新的 log
     lck->unlock();
     const LogId last_log_id = _log_manager->last_log_id(true);
     lck->lock();
@@ -1687,6 +1743,7 @@ void NodeImpl::elect_self(std::unique_lock<raft_mutex_t>* lck,
     }
     _vote_ctx.set_last_log_id(last_log_id);
 
+    // 获取所有 peer 并向其发起 RequestVote RPC（同 prevote 阶段）
     std::set<PeerId> peers;
     _conf.list_peers(&peers);
     request_peers_to_vote(peers, _vote_ctx.disrupted_leader());
@@ -1703,11 +1760,15 @@ void NodeImpl::elect_self(std::unique_lock<raft_mutex_t>* lck,
         _voted_id.reset();
         return;
     }
+
+    // 尝试给自己投票（同 prevote 阶段）
     grant_self(&_vote_ctx, lck);
 }
 
 void NodeImpl::request_peers_to_vote(const std::set<PeerId>& peers,
                                      const DisruptedLeader& disrupted_leader) {
+
+    // 同 pre vote 阶段，遍历所有 peer，发起 Request_vote RPC
     for (std::set<PeerId>::const_iterator
         iter = peers.begin(); iter != peers.end(); ++iter) {
         if (*iter == _server_id) {
@@ -1745,7 +1806,7 @@ void NodeImpl::request_peers_to_vote(const std::set<PeerId>& peers,
     }
 }
 
-// in lock
+// in lock - 将节点状态回退为 follower
 void NodeImpl::step_down(const int64_t term, bool wakeup_a_candidate, 
                          const butil::Status& status) {
     BRAFT_VLOG << "node " << _group_id << ":" << _server_id
@@ -1778,7 +1839,7 @@ void NodeImpl::step_down(const int64_t term, bool wakeup_a_candidate,
     PeerId empty_id;
     reset_leader_id(empty_id, status);
 
-    // soft state in memory
+    // soft state in memory - 将状态回退到 follower
     _state = STATE_FOLLOWER;
     // _conf_ctx.reset() will stop replicators of catching up nodes
     _conf_ctx.reset();
@@ -1791,8 +1852,9 @@ void NodeImpl::step_down(const int64_t term, bool wakeup_a_candidate,
     }
 
     // meta state
+    // 如果 term 大于 自身 term，则更新自身 term
     if (term > _current_term) {
-        _current_term = term;
+        _current_term = term; // 更新自身 term
         _voted_id.reset();
         //TODO: outof lock
         butil::Status status = _meta_storage->
@@ -1887,24 +1949,27 @@ private:
     int64_t _term;
 };
 
-// in lock
+// in lock - candidate 赢得选举后调用 become_leader()
 void NodeImpl::become_leader() {
     CHECK(_state == STATE_CANDIDATE);
     LOG(INFO) << "node " << _group_id << ":" << _server_id
               << " term " << _current_term
               << " become leader of group " << _conf.conf
               << " " << _conf.old_conf;
-    // cancel candidate vote timer
+    // 停止 vote_timer
     _vote_timer.stop();
     _vote_ctx.reset(this);
 
+    // 将状态设置为 leader，leader_id 设置成自己
     _state = STATE_LEADER;
     _leader_id = _server_id;
 
+    // 将 replicator_group 的 term 设置为当前 term
     _replicator_group.reset_term(_current_term);
     _follower_lease.reset();
     _leader_lease.on_leader_start(_current_term);
 
+    // 将其他所有的 peer 添加到 replicator_group 中，并调用 Replicator::start
     std::set<PeerId> peers;
     _conf.list_peers(&peers);
     for (std::set<PeerId>::const_iterator
@@ -2062,6 +2127,7 @@ void NodeImpl::unsafe_apply_configuration(const Configuration& new_conf,
     _log_manager->check_and_set_configuration(&_conf);
 }
 
+// 对应 node 处理 pre_vote request 请求
 int NodeImpl::handle_pre_vote_request(const RequestVoteRequest* request,
                                       RequestVoteResponse* response) {
     std::unique_lock<raft_mutex_t> lck(_mutex);
@@ -2088,6 +2154,8 @@ int NodeImpl::handle_pre_vote_request(const RequestVoteRequest* request,
     bool granted = false;
     bool rejected_by_lease = false;
     do {
+        /* 比较 request 中的 term 和 自己当前的 term，
+        如果小于自己当前的 term 则返回 false，即忽略该请求 */
         if (request->term() < _current_term) {
             // ignore older term
             LOG(INFO) << "node " << _group_id << ":" << _server_id
@@ -2104,9 +2172,13 @@ int NodeImpl::handle_pre_vote_request(const RequestVoteRequest* request,
         // pre_vote not need ABA check after unlock&lock
 
         int64_t votable_time = _follower_lease.votable_time_from_now();
+
+        // 进一步比较双方的日志，只有对方的日志较久则不会给他投票
         bool grantable = (LogId(request->last_log_index(), request->last_log_term())
                         >= last_log_id);
         if (grantable) {
+
+            // 判断上一个 leader 是否过期，如果没有过期，则不会投票给该节点
             granted = (votable_time == 0);
             rejected_by_lease = (votable_time > 0);
         }
@@ -2129,6 +2201,7 @@ int NodeImpl::handle_pre_vote_request(const RequestVoteRequest* request,
     return 0;
 }
 
+// 收到 RequestVote RPC 的节点处理请求
 int NodeImpl::handle_request_vote_request(const RequestVoteRequest* request,
                                           RequestVoteResponse* response) {
     std::unique_lock<raft_mutex_t> lck(_mutex);
@@ -2144,6 +2217,7 @@ int NodeImpl::handle_request_vote_request(const RequestVoteRequest* request,
         return EINVAL;
     }
 
+    // 从 request 中获取 candidate_id
     PeerId candidate_id;
     if (0 != candidate_id.parse(request->server_id())) {
         LOG(WARNING) << "node " << _group_id << ":" << _server_id
@@ -2167,7 +2241,7 @@ int NodeImpl::handle_request_vote_request(const RequestVoteRequest* request,
     int64_t previous_term = _current_term;
     bool rejected_by_lease = false;
     do {
-        // ignore older term
+        // 如果收到 request 中的 term 小于自己的 term，则忽视并设置自己的 term 和 granted 返回
         if (request->term() < _current_term) {
             // ignore older term
             LOG(INFO) << "node " << _group_id << ":" << _server_id
@@ -2177,7 +2251,7 @@ int NodeImpl::handle_request_vote_request(const RequestVoteRequest* request,
             break;
         }
 
-        // get last_log_id outof node mutex
+        // 获取最新 log_id
         lck.unlock();
         LogId last_log_id = _log_manager->last_log_id(true);
         lck.lock();
@@ -2206,7 +2280,7 @@ int NodeImpl::handle_request_vote_request(const RequestVoteRequest* request,
             break;
         }
 
-        // increase current term, change state to follower
+        // 如果 request 中的 term 大于自己的 term，则回退到 follow 状态并重启 election_timeout
         if (request->term() > _current_term) {
             butil::Status status;
             status.set_error(EHIGHERTERMREQUEST, "Raft node receives higher term "
@@ -2215,13 +2289,13 @@ int NodeImpl::handle_request_vote_request(const RequestVoteRequest* request,
             step_down(request->term(), false, status);
         }
 
-        // save
+        // 如果 request 中的 log 比自身的新，而且当前节点还未投票的话，就回退到 follower 并投给 candidate
         if (log_is_ok && _voted_id.is_empty()) {
             butil::Status status;
             status.set_error(EVOTEFORCANDIDATE, "Raft node votes for some candidate, "
                     "step down to restart election_timer.");
             step_down(request->term(), false, status);
-            _voted_id = candidate_id;
+            _voted_id = candidate_id; // 给 candidate 投票
             //TODO: outof lock
             status = _meta_storage->
                     set_term_and_votedfor(_current_term, candidate_id, _v_group_id);
@@ -2340,6 +2414,7 @@ private:
     int64_t _term;
 };
 
+// 处理 append entries RPC 请求
 void NodeImpl::handle_append_entries_request(brpc::Controller* cntl,
                                              const AppendEntriesRequest* request,
                                              AppendEntriesResponse* response,
@@ -2347,7 +2422,7 @@ void NodeImpl::handle_append_entries_request(brpc::Controller* cntl,
                                              bool from_append_entries_cache) {
     std::vector<LogEntry*> entries;
     entries.reserve(request->entries_size());
-    brpc::ClosureGuard done_guard(done);
+    brpc::ClosureGuard done_guard(done); // 通过该对象析构函数，确保 done->run() 被调用
     std::unique_lock<raft_mutex_t> lck(_mutex);
 
     // pre set term, to avoid get term in lock
@@ -2365,6 +2440,7 @@ void NodeImpl::handle_append_entries_request(brpc::Controller* cntl,
         return;
     }
 
+    // 从 request 中获取 server_id
     PeerId server_id;
     if (0 != server_id.parse(request->server_id())) {
         lck.unlock();
@@ -2377,7 +2453,7 @@ void NodeImpl::handle_append_entries_request(brpc::Controller* cntl,
         return;
     }
 
-    // check stale term
+    // 检查 request term 是否小于自身当前 term，若小于则设置 success 为 false 并返回自身 term
     if (request->term() < _current_term) {
         const int64_t saved_current_term = _current_term;
         lck.unlock();
@@ -2390,9 +2466,10 @@ void NodeImpl::handle_append_entries_request(brpc::Controller* cntl,
         return;
     }
 
-    // check term and state to step down
+    // request term >= 当前 term，检查当前 term 以及 state，回退到 follower，并更新 leader_id
     check_step_down(request->term(), server_id);   
      
+    // 出现脑裂错误，即一个 term 内出现多个 leader
     if (server_id != _leader_id) {
         LOG(ERROR) << "Another peer " << _group_id << ":" << server_id
                    << " declares that it is the leader at term=" << _current_term 
@@ -2408,10 +2485,12 @@ void NodeImpl::handle_append_entries_request(brpc::Controller* cntl,
     }
 
     if (!from_append_entries_cache) {
-        // Requests from cache already updated timestamp
+        /* Requests from cache already updated timestamp
+        更新 _last_leader_timestamp — leader 时间戳，该时间戳用于判断 leader 是否过期 */
         _follower_lease.renew(_leader_id);
     }
 
+    // 如果节点正在安装快照，则返回失败
     if (request->entries_size() > 0 &&
             (_snapshot_executor
                 && _snapshot_executor->is_installing_snapshot())) {
@@ -2467,6 +2546,7 @@ void NodeImpl::handle_append_entries_request(brpc::Controller* cntl,
         return;
     }
 
+    // 若 request entries 为空，即表示当前请求为心跳，直接设置 response 并返回
     if (request->entries_size() == 0) {
         response->set_success(true);
         response->set_term(_current_term);
@@ -3510,14 +3590,20 @@ void NodeImpl::grant_self(VoteBallotCtx* vote_ctx, std::unique_lock<raft_mutex_t
     // 2. follower lease expire.
     int64_t wait_ms = _follower_lease.votable_time_from_now();
     if (wait_ms == 0) {
+
+        // 给自己投票
         vote_ctx->grant(_server_id);
+
+        // 检查加上自己的一票后，是否获得了大多数节点的选票
         if (!vote_ctx->granted()) {
-            return;
+            return; 
         }
+
+        // 若获得了大多数选票，则进一步检查当前投票为预投票还是正式投票
         if (vote_ctx == &_pre_vote_ctx) {
-            elect_self(lck);
+            elect_self(lck); // 预投票成功当选，发起正式投票
         } else {
-            become_leader();
+            become_leader(); // 正式投票成功当选，成为 leader
         }
         return;
     }

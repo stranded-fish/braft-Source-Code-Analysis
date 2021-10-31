@@ -28,6 +28,7 @@ RaftServiceImpl::~RaftServiceImpl() {
     global_node_manager->remove_address(_addr);
 }
 
+// 处理 pre_vote RPC 请求
 void RaftServiceImpl::pre_vote(google::protobuf::RpcController* cntl_base,
                           const RequestVoteRequest* request,
                           RequestVoteResponse* response,
@@ -36,6 +37,7 @@ void RaftServiceImpl::pre_vote(google::protobuf::RpcController* cntl_base,
     brpc::Controller* cntl =
         static_cast<brpc::Controller*>(cntl_base);
 
+    // 通过 request 中的 group_id 和 peer_id 获取到对应的 node
     PeerId peer_id;
     if (0 != peer_id.parse(request->peer_id())) {
         cntl->SetFailed(EINVAL, "peer_id invalid");
@@ -51,6 +53,7 @@ void RaftServiceImpl::pre_vote(google::protobuf::RpcController* cntl_base,
     }
 
     // TODO: should return butil::Status
+    // 调用该 node 的 handle_pre_vote_request 方法
     int rc = node->handle_pre_vote_request(request, response);
     if (rc != 0) {
         cntl->SetFailed(rc, "%s", berror(rc));

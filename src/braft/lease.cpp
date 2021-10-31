@@ -114,8 +114,12 @@ int64_t FollowerLease::votable_time_from_now() {
     }
 
     int64_t now = butil::monotonic_time_ms();
+    
+    // votable_timestamp = leader 最近一次请求的时间戳 + 选举超时 + leader 续约时间
     int64_t votable_timestamp = _last_leader_timestamp + _election_timeout_ms +
                                 _max_clock_drift_ms;
+    
+    // 如果当前时间 >= votable_timestamp 即表示当前 leader 已失效，此时可以投票给其他节点
     if (now >= votable_timestamp) {
         return 0;
     }
