@@ -395,6 +395,8 @@ int Segment::append(const LogEntry* entry) {
         return -1;
     }
     CHECK_LE(data.length(), 1ul << 56ul);
+
+    // 组装 header
     char header_buf[ENTRY_HEADER_SIZE];
     const uint32_t meta_field = (entry->type << 24 ) | (_checksum_type << 16);
     RawPacker packer(header_buf);
@@ -410,6 +412,8 @@ int Segment::append(const LogEntry* entry) {
     butil::IOBuf* pieces[2] = { &header, &data };
     size_t start = 0;
     ssize_t written = 0;
+
+    // 将数据写入文件进行持久化存储
     while (written < (ssize_t)to_write) {
         const ssize_t n = butil::IOBuf::cut_multiple_into_file_descriptor(
                 _fd, pieces + start, ARRAY_SIZE(pieces) - start);
@@ -737,7 +741,7 @@ int SegmentLogStorage::append_entries(const std::vector<LogEntry*>& entries, IOM
         if (NULL == segment) {
             return i;
         }
-        int ret = segment->append(entry);
+        int ret = segment->append(entry); // 落盘
         if (0 != ret) {
             return i;
         }

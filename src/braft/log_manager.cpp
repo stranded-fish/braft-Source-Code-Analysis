@@ -441,8 +441,12 @@ void LogManager::append_entries(
     }
 
     done->_entries.swap(*entries);
+    
+    // 将任务提交到 disk_queue 中持久化保存
     int ret = bthread::execution_queue_execute(_disk_queue, done);
     CHECK_EQ(0, ret) << "execq execute failed, ret: " << ret << " err: " << berror();
+
+    // 将该 logs 复制给集群其他节点
     wakeup_all_waiter(lck);
 }
 
@@ -456,6 +460,8 @@ void LogManager::append_to_storage(std::vector<LogEntry*>* to_append,
         butil::Timer timer;
         timer.start();
         g_storage_append_entries_concurrency << 1;
+
+        // 调用 SegmentLogStorage::append_entries 落盘
         int nappent = _log_storage->append_entries(*to_append, metric);
         g_storage_append_entries_concurrency << -1;
         timer.stop();
@@ -510,7 +516,7 @@ public:
                             EIO, "Corrupted LogStorage");
                 }
                 _storage[i]->update_metric(&metric);
-                _storage[i]->Run();
+                _storage[i]->Run(); // 执行回调，进行投票
             }
             _to_append.clear();
         }
@@ -540,6 +546,7 @@ private:
     LogManager* _lm;
 };
 
+// 持久化 entries
 int LogManager::disk_thread(void* meta,
                             bthread::TaskIterator<StableClosure*>& iter) {
     if (iter.is_queue_stopped()) {
@@ -559,9 +566,9 @@ int LogManager::disk_thread(void* meta,
         done->metric.bthread_queue_time_us = butil::cpuwide_time_us() - 
                                             done->metric.start_time_us;
         if (!done->_entries.empty()) {
-            ab.append(done);
+            ab.append(done); // 添加 entry
         } else {
-            ab.flush();
+            ab.flush();      // 刷新 - 持久化存储，并执行回调
             int ret = 0;
             do {
                 LastLogIdClosure* llic =
@@ -614,7 +621,7 @@ int LogManager::disk_thread(void* meta,
         }
     }
     CHECK(!iter) << "Must iterate to the end";
-    ab.flush();
+    ab.flush(); // 刷新 - 持久化存储，并执行回调
     log_manager->set_disk_id(last_id);
     return 0;
 }

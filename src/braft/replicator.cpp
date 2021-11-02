@@ -346,6 +346,7 @@ void Replicator::_on_heartbeat_returned(
     return;
 }
 
+// 处理 AppendEntries 响应
 void Replicator::_on_rpc_returned(ReplicatorId id, brpc::Controller* cntl,
                      AppendEntriesRequest* request, 
                      AppendEntriesResponse* response,
@@ -701,6 +702,7 @@ void Replicator::_send_entries() {
     _wait_more_entries();
 }
 
+// leader 复制日志给其他节点
 int Replicator::_continue_sending(void* arg, int error_code) {
     Replicator* r = NULL;
     bthread_id_t id = { (uint64_t)arg };

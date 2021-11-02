@@ -656,8 +656,10 @@ DEFINE_int32(raft_apply_batch, 32, "Max number of tasks that can be applied "
                                    " in a single batch");
 BRPC_VALIDATE_GFLAG(raft_apply_batch, ::brpc::PositiveInteger);
 
+// 执行 - 提交 task
 int NodeImpl::execute_applying_tasks(
         void* meta, bthread::TaskIterator<LogEntryAndClosure>& iter) {
+    // 若 ExecutionQueue stopped，即不会再接收更多 task，则直接返回
     if (iter.is_queue_stopped()) {
         return 0;
     }
@@ -667,6 +669,9 @@ int NodeImpl::execute_applying_tasks(
     DEFINE_SMALL_ARRAY(LogEntryAndClosure, tasks, batch_size, 256);
     size_t cur_size = 0;
     NodeImpl* m = (NodeImpl*)meta;
+
+    /* 遍历队列中所有的 task，将其按最大 batch_size 为一组放到 task 数组中，
+    并调用 NodeImpl::apply(LogEntryAndClosure tasks[], size_t size) */
     for (; iter; ++iter) {
         if (cur_size == batch_size) {
             m->apply(tasks, cur_size);
@@ -680,6 +685,7 @@ int NodeImpl::execute_applying_tasks(
     return 0;
 }
 
+// 用户接口 - 提交 task
 void NodeImpl::apply(const Task& task) {
     LogEntry* entry = new LogEntry;
     entry->AddRef();
@@ -688,6 +694,8 @@ void NodeImpl::apply(const Task& task) {
     m.entry = entry;
     m.done = task.done;
     m.expected_term = task.expected_term;
+
+    // 将封装后的 task 加入执行队列，然后调用 NodeImpl::execute_applying_tasks
     if (_apply_queue->execute(m, &bthread::TASK_OPTIONS_INPLACE, NULL) != 0) {
         task.done->status().set_error(EPERM, "Node is down");
         entry->Release();
@@ -2016,6 +2024,7 @@ LeaderStableClosure::LeaderStableClosure(const NodeId& node_id,
 {
 }
 
+// leader append entry 成功后，执行回调投票
 void LeaderStableClosure::Run() {
     if (status().ok()) {
         if (_ballot_box) {
@@ -2042,6 +2051,7 @@ void LeaderStableClosure::Run() {
     delete this;
 }
 
+// 提交 task 数组
 void NodeImpl::apply(LogEntryAndClosure tasks[], size_t size) {
     g_apply_tasks_batch_counter << size;
 
@@ -2049,6 +2059,8 @@ void NodeImpl::apply(LogEntryAndClosure tasks[], size_t size) {
     entries.reserve(size);
     std::unique_lock<raft_mutex_t> lck(_mutex);
     bool reject_new_user_logs = (_node_readonly || _majority_nodes_readonly);
+
+    // 若该节点不为 leader 或者为 只读状态，则拒绝此次 tasks
     if (_state != STATE_LEADER || reject_new_user_logs) {
         butil::Status st;
         if (_state == STATE_LEADER && reject_new_user_logs) {
@@ -2069,7 +2081,12 @@ void NodeImpl::apply(LogEntryAndClosure tasks[], size_t size) {
         }
         return;
     }
+
+    // 遍历整个 task 数组
     for (size_t i = 0; i < size; ++i) {
+
+        /* 检查每个 task 的 expected_term 是否等于当前 term，若不等于，
+        则释放该 task 资源，并调用该 task 的 done 返回给用户 */
         if (tasks[i].expected_term != -1 && tasks[i].expected_term != _current_term) {
             BRAFT_VLOG << "node " << _group_id << ":" << _server_id
                       << " can't apply taks whose expected_term=" << tasks[i].expected_term
@@ -2083,13 +2100,19 @@ void NodeImpl::apply(LogEntryAndClosure tasks[], size_t size) {
             tasks[i].entry->Release();
             continue;
         }
+
+        // 若 term 符合要求，则将其加入到 entries 中
         entries.push_back(tasks[i].entry);
-        entries.back()->id.term = _current_term;
+        entries.back()->id.term = _current_term; // 设置 entry term
         entries.back()->type = ENTRY_TYPE_DATA;
+
+        // 将 task 放入 ballot 用于投票
         _ballot_box->append_pending_task(_conf.conf,
                                          _conf.stable() ? NULL : &_conf.old_conf,
                                          tasks[i].done);
     }
+    
+    // 调用 _log_manager->append_entries 尝试 append entries
     _log_manager->append_entries(&entries,
                                new LeaderStableClosure(
                                         NodeId(_group_id, _server_id),
