@@ -29,10 +29,14 @@
 
 namespace braft {
 
+/* 单次 AppendEntries 请求中的最大 entry 数，
+当该参数过大时，follower 端将可能出现乱序到达情况 */
 DEFINE_int32(raft_max_entries_size, 1024,
              "The max number of entries in AppendEntriesRequest");
 BRPC_VALIDATE_GFLAG(raft_max_entries_size, ::brpc::PositiveInteger);
 
+/* AppendEntries 的最大并行请求数，
+当该参数过大时，follower 端将可能出现乱序到达情况 */
 DEFINE_int32(raft_max_parallel_append_entries_rpc_num, 1,
              "The max number of parallel AppendEntries requests");
 BRPC_VALIDATE_GFLAG(raft_max_parallel_append_entries_rpc_num,
