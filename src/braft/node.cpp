@@ -44,11 +44,15 @@ DEFINE_bool(raft_step_down_when_vote_timedout, true,
             "candidate steps down when reaching timeout");
 BRPC_VALIDATE_GFLAG(raft_step_down_when_vote_timedout, brpc::PassValidate);
 
+/* 为乱序的 append entries 请求启用缓存，开启后，会在收到乱序的 entries 后调用
+handle_out_of_order_append_entries() 方法保存该 entries，并在每次按序保存 entries 后，
+检查是否有之前保存的乱序 entries 为该位置的下一个匹配，若有则更新 local_last_index */
 DEFINE_bool(raft_enable_append_entries_cache, false,
             "enable cache for out-of-order append entries requests, should used when "
             "pipeline replication is enabled (raft_max_parallel_append_entries_rpc_num > 1).");
 BRPC_VALIDATE_GFLAG(raft_enable_append_entries_cache, ::brpc::PassValidate);
 
+// 保存乱序 append entries 的最大缓存大小
 DEFINE_int32(raft_max_append_entries_cache_size, 8,
              "the max size of out-of-order append entries cache");
 BRPC_VALIDATE_GFLAG(raft_max_append_entries_cache_size, ::brpc::PositiveInteger);
@@ -2525,12 +2529,20 @@ void NodeImpl::handle_append_entries_request(brpc::Controller* cntl,
 
     const int64_t prev_log_index = request->prev_log_index();
     const int64_t prev_log_term = request->prev_log_term();
-    const int64_t local_prev_log_term = _log_manager->get_term(prev_log_index);
+
+    /* 检查当前 log_index 与请求中的 prev_log_index 是否匹配，
+    若不匹配将 local_prev_log_term 赋值为 0，并在后续触发乱序处理 */
+    const int64_t local_prev_log_term = _log_manager->get_term(prev_log_index); 
+
+    // 收到乱序 append entries
     if (local_prev_log_term != prev_log_term) {
         int64_t last_index = _log_manager->last_log_index();
         int64_t saved_term = request->term();
         int     saved_entries_size = request->entries_size();
         std::string rpc_server_id = request->server_id();
+
+        /* 判断该 entries 是否来自保存在 cache 中的 rpc 请求，
+        若是则直接返回 false，否则，进一步调用保存乱序 entries 的方法 */
         if (!from_append_entries_cache &&
             handle_out_of_order_append_entries(
                     cntl, request, response, done, last_index)) {
@@ -2619,7 +2631,8 @@ void NodeImpl::handle_append_entries_request(brpc::Controller* cntl,
         }
     }
 
-    // check out-of-order cache
+    /* check out-of-order cache
+    判断是否有匹配的乱序 entries */
     check_append_entries_cache(index);
 
     FollowerStableClosure* c = new FollowerStableClosure(
@@ -2964,11 +2977,13 @@ void NodeImpl::stop_replicator(const std::set<PeerId>& keep,
     }
 }
 
+// 处理乱序到达的 entries
 bool NodeImpl::handle_out_of_order_append_entries(brpc::Controller* cntl,
                                                   const AppendEntriesRequest* request,
                                                   AppendEntriesResponse* response,
                                                   google::protobuf::Closure* done,
                                                   int64_t local_last_index) {
+    // 需确保为乱序的 append entries 设置启用缓存
     if (!FLAGS_raft_enable_append_entries_cache ||
         local_last_index >= request->prev_log_index() ||
         request->entries_size() == 0) {
@@ -2977,12 +2992,16 @@ bool NodeImpl::handle_out_of_order_append_entries(brpc::Controller* cntl,
     if (!_append_entries_cache) {
         _append_entries_cache = new AppendEntriesCache(this, ++_append_entries_cache_version);
     }
+
+    // 新建 rpc 请求
     AppendEntriesRpc* rpc = new AppendEntriesRpc;
     rpc->cntl = cntl;
     rpc->request = request;
     rpc->response = response;
     rpc->done = done;
     rpc->receive_time_ms = butil::gettimeofday_ms();
+
+    // 保存包含乱序 entries 的 rpc 请求
     bool rc = _append_entries_cache->store(rpc);
     if (!rc && _append_entries_cache->empty()) {
         delete _append_entries_cache;
@@ -3078,6 +3097,7 @@ bool NodeImpl::AppendEntriesCache::empty() const {
     return _rpc_map.empty();
 }
 
+// 保存含有乱序 entries 的 rpc 请求
 bool NodeImpl::AppendEntriesCache::store(AppendEntriesRpc* rpc) {
     if (!_rpc_map.empty()) {
         bool need_clear = false;
@@ -3109,6 +3129,9 @@ bool NodeImpl::AppendEntriesCache::store(AppendEntriesRpc* rpc) {
         }
     }
     _rpc_queue.Append(rpc);
+
+    /* 将 {prev_log_index， rpc} 请求保存到 rpc_map 中，map 以 key 值 - 
+    prev_log_index 进行升序排序，此时 map 首元素为下一个将要匹配的乱序请求 */
     _rpc_map.insert(std::make_pair(rpc->request->prev_log_index(), rpc));
 
     // The first rpc need to start the timer
@@ -3137,6 +3160,7 @@ bool NodeImpl::AppendEntriesCache::store(AppendEntriesRpc* rpc) {
     return true;
 }
 
+// 处理保存有乱序 entries 的 rpc 请求
 void NodeImpl::AppendEntriesCache::process_runable_rpcs(int64_t local_last_index) {
     CHECK(!_rpc_map.empty());
     CHECK(!_rpc_queue.empty());
@@ -3144,9 +3168,14 @@ void NodeImpl::AppendEntriesCache::process_runable_rpcs(int64_t local_last_index
     for (std::map<int64_t, AppendEntriesRpc*>::iterator it = _rpc_map.begin();
         it != _rpc_map.end();) {
         AppendEntriesRpc* rpc = it->second;
+
+        /* rpc_map 中的请求以 log_index 为关键字升序排序，
+        故当其 > local_last_index 时，后续将不会再有匹配的乱序 entries */
         if (rpc->request->prev_log_index() > local_last_index) {
             break;
         }
+
+        // 出现匹配的乱序 entries，更新 local_last_index，并从 map 中去除该请求
         local_last_index = rpc->request->prev_log_index() + rpc->request->entries_size();
         _rpc_map.erase(it++);
         rpc->RemoveFromList();
